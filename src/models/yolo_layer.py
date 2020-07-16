@@ -54,6 +54,51 @@ class YoloLayer(nn.Module):
         self.anchor_w = self.scaled_anchors[:, 0:1].view((1, self.num_anchors, 1, 1))
         self.anchor_h = self.scaled_anchors[:, 1:2].view((1, self.num_anchors, 1, 1))
 
+    def bboxes_iou(self, anchors, gwh):
+        """Calculate the Intersection of Unions (IoUs) between bounding boxes.
+        IoU is calculated as a ratio of area of the intersection
+        and area of the union.
+
+        Args:
+            bbox_a (array): An array whose shape is :math:`(N, 4)`.
+                :math:`N` is the number of bounding boxes.
+                The dtype should be :obj:`numpy.float32`.
+            bbox_b (array): An array similar to :obj:`bbox_a`,
+                whose shape is :math:`(K, 4)`.
+                The dtype should be :obj:`numpy.float32`.
+        Returns:
+            array:
+            An array whose shape is :math:`(N, K)`. \
+            An element at index :math:`(n, k)` contains IoUs between \
+            :math:`n` th bounding box in :obj:`bbox_a` and :math:`k` th bounding \
+            box in :obj:`bbox_b`.
+
+        from: https://github.com/chainer/chainercv
+        https://github.com/ultralytics/yolov3/blob/eca5b9c1d36e4f73bf2f94e141d864f1c2739e23/utils/utils.py#L262-L282
+        """
+
+        bboxes_a = torch.zeros((len(anchors), 4), dtype=torch.float, device=self.device)
+        bboxes_b = torch.zeros((len(gwh), 4), dtype=torch.float, device=self.device)
+        bboxes_a[:, 2:] = anchors
+        bboxes_b[:, 2:] = gwh
+
+        # intersection top left
+        tl = torch.max((bboxes_a[:, None, :2] - bboxes_a[:, None, 2:] / 2),
+                       (bboxes_b[:, :2] - bboxes_b[:, 2:] / 2))
+        # intersection bottom right
+        br = torch.min((bboxes_a[:, None, :2] + bboxes_a[:, None, 2:] / 2),
+                       (bboxes_b[:, :2] + bboxes_b[:, 2:] / 2))
+
+        area_a = torch.prod(bboxes_a[:, 2:], 1)
+        area_b = torch.prod(bboxes_b[:, 2:], 1)
+
+        en = (tl < br).type(tl.type()).prod(dim=2)
+        area_i = torch.prod(br - tl, 2) * en  # * ((tl < br).all())
+        area_u = area_a[:, None] + area_b - area_i
+        ious = area_i / area_u
+
+        return ious
+
     def build_targets(self, pred_cls, target, anchors):
         """ Built yolo targets to compute loss
 
@@ -88,7 +133,7 @@ class YoloLayer(nn.Module):
             gdr = target_boxes[:, 6]
 
             # Get anchors with best iou
-            ious = torch.stack([rotated_box_wh_iou_polygon(anchor, gwh, gimre) for anchor in anchors])
+            ious = self.bboxes_iou(anchors[:, :2], gwh)
             best_ious, best_n = ious.max(0)
 
             b, target_labels = target[:, :2].long().t()
