@@ -163,7 +163,25 @@ def build_yolo_target(labels):
             x1 = (x - bc["minX"]) / (bc["maxX"] - bc["minX"])  # we should put this in [0,1], so divide max_size  40 m
             w1 = w / (bc["maxY"] - bc["minY"])
             l1 = l / (bc["maxX"] - bc["minX"])
-            target.append([cl, y1, x1, w1, l1, math.sin(float(yaw)), math.cos(float(yaw))])
+
+            im = math.sin(float(yaw))
+            re = math.cos(float(yaw))
+            # Get direction of the box (4 conners)
+            if (im > 0) and (re > 0):
+                dr = 0
+            elif (im > 0) and (re < 0):
+                dr = 1
+            elif (im < 0) and (re < 0):
+                dr = 2
+            elif (im < 0) and (re > 0):
+                dr = 3
+            else:
+                raise ValueError
+
+            # sign = -1 if dr in [2, 3] else 1
+            # yaw = sign * np.arctan2(abs(im), abs(re))
+            # target format: class, x, y, w, l, im, re, direction
+            target.append([cl, y1, x1, w1, l1, abs(im), abs(re), dr])
 
     return np.array(target, dtype=np.float32)
 

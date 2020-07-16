@@ -108,9 +108,9 @@ class KittiDataset(Dataset):
         target = kitti_bev_utils.build_yolo_target(labels)
         img_file = os.path.join(self.image_dir, '{:06d}.png'.format(sample_id))
 
-        # on image space: targets are formatted as (box_idx, class, x, y, w, l, sin(yaw), cos(yaw))
+        # on image space: targets are formatted as (box_idx, class, x, y, w, l, im, re, direction)
         n_target = len(target)
-        targets = torch.zeros((n_target, 8))
+        targets = torch.zeros((n_target, 9))
         if n_target > 0:
             targets[:, 1:] = torch.from_numpy(target)
 

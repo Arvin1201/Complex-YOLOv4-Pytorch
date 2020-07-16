@@ -9,6 +9,7 @@ import sys
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 sys.path.append('../')
 
@@ -35,8 +36,6 @@ class YoloLayer(nn.Module):
         self.class_scale = 1
 
         self.seen = 0
-        self.mse_loss = nn.MSELoss()
-        self.bce_loss = nn.BCELoss()
         # Initialize dummy variables
         self.grid_size = 0
         self.img_size = 0
@@ -59,7 +58,7 @@ class YoloLayer(nn.Module):
         """ Built yolo targets to compute loss
 
         :param pred_cls: [num_samples or batch, num_anchors, grid_size, grid_size, num_classes]
-        :param target: [num_boxes, 8]
+        :param target: [num_boxes, 9]
         :param anchors: [num_anchors, 4]
         :return:
         """
@@ -75,16 +74,18 @@ class YoloLayer(nn.Module):
         th = torch.full(size=(nB, nA, nG, nG), fill_value=0, device=self.device, dtype=torch.float)
         tim = torch.full(size=(nB, nA, nG, nG), fill_value=0, device=self.device, dtype=torch.float)
         tre = torch.full(size=(nB, nA, nG, nG), fill_value=0, device=self.device, dtype=torch.float)
+        tdr = torch.full(size=(nB, nA, nG, nG), fill_value=0, device=self.device, dtype=torch.float)
         tcls = torch.full(size=(nB, nA, nG, nG, nC), fill_value=0, device=self.device, dtype=torch.float)
         tconf = obj_mask.float()
 
         if n_target_boxes > 0:  # Make sure that there is at least 1 box
             # Convert to position relative to box
-            target_boxes = target[:, 2:8]
+            target_boxes = target[:, 2:]
 
             gxy = target_boxes[:, :2] * nG
             gwh = target_boxes[:, 2:4] * nG
-            gimre = target_boxes[:, 4:]
+            gimre = target_boxes[:, 4:6]
+            gdr = target_boxes[:, 6]
 
             # Get anchors with best iou
             ious = torch.stack([rotated_box_wh_iou_polygon(anchor, gwh, gimre) for anchor in anchors])
@@ -113,17 +114,19 @@ class YoloLayer(nn.Module):
             # Im and real part
             tim[b, best_n, gj, gi] = gim
             tre[b, best_n, gj, gi] = gre
+            tdr[b, best_n, gj, gi] = gdr
 
             # One-hot encoding of label
             tcls[b, best_n, gj, gi, target_labels] = 1
             tconf = obj_mask.float()
 
-        return obj_mask.type(torch.bool), noobj_mask.type(torch.bool), tx, ty, tw, th, tim, tre, tcls, tconf
+        return obj_mask.type(torch.bool), noobj_mask.type(torch.bool), tx, ty, tw, th, tim, tre, tdr, tcls, tconf
 
     def forward(self, x, targets=None, img_size=608):
         """
-        :param x: [num_samples or batch, num_anchors * (6 + 1 + num_classes), grid_size, grid_size]
-        :param targets: [num boxes, 8] (box_idx, class, x, y, w, l, sin(yaw), cos(yaw))
+        predictions: class, x, y, w, l, im, re, direction (x4)
+        :param x: [num_samples or batch, num_anchors * (6 + 4 + 1 + num_classes), grid_size, grid_size]
+        :param targets: [num boxes, 8] (box_idx, class, x, y, w, l, direction, im, re)
         :param img_size: default 608
         :return:
         """
@@ -131,19 +134,20 @@ class YoloLayer(nn.Module):
         self.device = x.device
         num_samples, _, _, grid_size = x.size()
 
-        prediction = x.view(num_samples, self.num_anchors, self.num_classes + 7, grid_size, grid_size)
+        prediction = x.view(num_samples, self.num_anchors, self.num_classes + 11, grid_size, grid_size)
         prediction = prediction.permute(0, 1, 3, 4, 2).contiguous()
-        # prediction size: [num_samples, num_anchors, grid_size, grid_size, num_classes + 7]
+        # prediction size: [num_samples, num_anchors, grid_size, grid_size, num_classes + 11]
 
         # Get outputs
-        x = torch.sigmoid(prediction[..., 0]) * self.scale_x_y - 0.5 * (self.scale_x_y - 1)  # Center x
-        y = torch.sigmoid(prediction[..., 1]) * self.scale_x_y - 0.5 * (self.scale_x_y - 1)  # Center y
-        w = prediction[..., 2]  # Width
-        h = prediction[..., 3]  # Height
-        im = prediction[..., 4]  # angle imaginary part
-        re = prediction[..., 5]  # angle real part
-        pred_conf = torch.sigmoid(prediction[..., 6])  # Conf
-        pred_cls = torch.sigmoid(prediction[..., 7:])  # Cls pred.
+        pred_x = torch.sigmoid(prediction[..., 0]) * self.scale_x_y - 0.5 * (self.scale_x_y - 1)  # Center x
+        pred_y = torch.sigmoid(prediction[..., 1]) * self.scale_x_y - 0.5 * (self.scale_x_y - 1)  # Center y
+        pred_w = prediction[..., 2]  # Width
+        pred_h = prediction[..., 3]  # Height
+        pred_im = torch.sigmoid(prediction[..., 4])  # angle imaginary part
+        pred_re = torch.sigmoid(prediction[..., 5])  # angle real part
+        pred_direction = prediction[..., 6:10]  # direction of the object
+        pred_conf = torch.sigmoid(prediction[..., 10])  # Conf
+        pred_cls = torch.sigmoid(prediction[..., 11:])  # Cls pred.
 
         # If grid size does not match current we compute new offsets
         if grid_size != self.grid_size:
@@ -151,41 +155,43 @@ class YoloLayer(nn.Module):
 
         # Add offset and scale with anchors
         # pred_boxes size: [num_samples, num_anchors, grid_size, grid_size, 6]
-        pred_boxes = torch.empty(prediction[..., :6].shape, device=self.device, dtype=torch.float)
-        pred_boxes[..., 0] = x.detach() + self.grid_x
-        pred_boxes[..., 1] = y.detach() + self.grid_y
-        pred_boxes[..., 2] = torch.exp(w.detach()) * self.anchor_w
-        pred_boxes[..., 3] = torch.exp(h.detach()) * self.anchor_h
-        pred_boxes[..., 4] = im.detach()
-        pred_boxes[..., 5] = re.detach()
+        pred_boxes = torch.empty(prediction[..., :7].shape, device=self.device, dtype=torch.float)
+        pred_boxes[..., 0] = pred_x.detach() + self.grid_x
+        pred_boxes[..., 1] = pred_y.detach() + self.grid_y
+        pred_boxes[..., 2] = torch.exp(pred_w.detach()) * self.anchor_w
+        pred_boxes[..., 3] = torch.exp(pred_h.detach()) * self.anchor_h
+        pred_boxes[..., 4] = pred_im.detach()
+        pred_boxes[..., 5] = pred_re.detach()
+        pred_boxes[..., 6] = pred_direction.detach().argmax(-1)  # Take the pred direction
 
         output = torch.cat((
             pred_boxes[..., :4].view(num_samples, -1, 4) * self.stride,
-            pred_boxes[..., 4:].view(num_samples, -1, 2),
+            pred_boxes[..., 4:].view(num_samples, -1, 3),
             pred_conf.view(num_samples, -1, 1),
             pred_cls.view(num_samples, -1, self.num_classes),
         ), dim=-1)
-        # output size: [num_samples, num boxes, 7 + num_classes]
+        # output size: [num_samples, num boxes, 7 + 1 + num_classes]
 
         if targets is None:
             return output, 0
         else:
-            obj_mask, noobj_mask, tx, ty, tw, th, tim, tre, tcls, tconf = self.build_targets(pred_cls=pred_cls,
-                                                                                             target=targets,
-                                                                                             anchors=self.scaled_anchors)
+            obj_mask, noobj_mask, tx, ty, tw, th, tim, tre, tdr, tcls, tconf = self.build_targets(pred_cls=pred_cls,
+                                                                                                  target=targets,
+                                                                                                  anchors=self.scaled_anchors)
 
             # Loss : Mask outputs to ignore non-existing objects (except with conf. loss)
-            loss_x = self.mse_loss(x[obj_mask], tx[obj_mask])
-            loss_y = self.mse_loss(y[obj_mask], ty[obj_mask])
-            loss_w = self.mse_loss(w[obj_mask], tw[obj_mask])
-            loss_h = self.mse_loss(h[obj_mask], th[obj_mask])
-            loss_im = self.mse_loss(im[obj_mask], tim[obj_mask])
-            loss_re = self.mse_loss(re[obj_mask], tre[obj_mask])
-            loss_eular = loss_im + loss_re
-            loss_conf_obj = self.bce_loss(pred_conf[obj_mask], tconf[obj_mask])
-            loss_conf_noobj = self.bce_loss(pred_conf[noobj_mask], tconf[noobj_mask])
+            loss_x = F.mse_loss(pred_x[obj_mask], tx[obj_mask])
+            loss_y = F.mse_loss(pred_y[obj_mask], ty[obj_mask])
+            loss_w = F.mse_loss(pred_w[obj_mask], tw[obj_mask])
+            loss_h = F.mse_loss(pred_h[obj_mask], th[obj_mask])
+            loss_im = F.mse_loss(pred_im[obj_mask], tim[obj_mask])
+            loss_re = F.mse_loss(pred_re[obj_mask], tre[obj_mask])
+            loss_dr = F.cross_entropy(pred_direction.permute(0, 4, 1, 2, 3).contiguous(), tdr.long())
+            loss_eular = loss_im + loss_re + loss_dr
+            loss_conf_obj = F.binary_cross_entropy(pred_conf[obj_mask], tconf[obj_mask])
+            loss_conf_noobj = F.binary_cross_entropy(pred_conf[noobj_mask], tconf[noobj_mask])
             loss_conf = self.obj_scale * loss_conf_obj + self.noobj_scale * loss_conf_noobj
-            loss_cls = self.bce_loss(pred_cls[obj_mask], tcls[obj_mask])
+            loss_cls = F.binary_cross_entropy(pred_cls[obj_mask], tcls[obj_mask])
             total_loss = loss_x + loss_y + loss_w + loss_h + loss_eular + loss_conf + loss_cls
 
             # Metrics (store loss values using tensorboard)
@@ -197,6 +203,7 @@ class YoloLayer(nn.Module):
                 "h": to_cpu(loss_h).item(),
                 "im": to_cpu(loss_im).item(),
                 "re": to_cpu(loss_re).item(),
+                "dr": to_cpu(loss_dr).item(),
                 "conf": to_cpu(loss_conf).item(),
                 "cls": to_cpu(loss_cls).item()
             }
